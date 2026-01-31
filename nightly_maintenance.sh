@@ -141,7 +141,7 @@ if [ "$(date +%d)" -eq 01 ]; then
 
     echo "[Monthly] Removing old kernels and logs..."
     apt-get autoremove -y || handle_error "APT Autoremove failed"
-    journalctl --vacuum-time=1mo || handle_error "Journalctl vacuum failed"
+    journalctl --vacuum-time=1month || handle_error "Journalctl vacuum failed"
 fi
 
 echo "========================================================"
