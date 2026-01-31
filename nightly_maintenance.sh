@@ -8,9 +8,11 @@
 
 # 設定方法: 
 # 1. /usr/local/bin/nightly_maintenance.sh に置いて、
-# 2. sudo chmod +x /usr/local/bin/nightly_maintenance.sh して実行権限を付与して、
-# 3. sudo crontab -e でrootのcron設定を開き、
-# 4. 0 2 * * * /usr/local/bin/nightly_maintenance.sh を追加して毎日午前2時に実行するように設定 (時間は任意)。
+# 2. DISCORD_WEBHOOK_URL を自分のDiscord Webhook URLに書き換えて、
+# 3. sudo chmod +x /usr/local/bin/nightly_maintenance.sh して実行権限を付与して、
+# 4. sudo crontab -e でrootのcron設定を開き、
+# 5. 0 2 * * * /usr/local/bin/nightly_maintenance.sh を追加して毎日午前2時に実行するように設定 (時間は任意)して、
+# 6. sudo /usr/local/bin/nightly_maintenance.sh を手動で一度実行して動作確認（任意）。
 
 # ログローテーションの設定 (定期的にログを削除する場合): 
 # 1. 以下を設定
@@ -30,24 +32,21 @@
 
 # --- 設定 ---
 LOGFILE="/var/log/nightly_maintenance.log"
-# ↓ここにDiscordのWebhook URLを貼り付けてください
-DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/xxxx/xxxx"
+DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/xxxx/xxxx" # ← ★ここを書き換える
 HOSTNAME=$(hostname)
 
 # パス設定
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+
+# Nextcloudコマンドの定義
+OCC_CMD="/snap/bin/nextcloud.occ"
 
 # --- Discord通知関数 ---
-# Usage: send_discord "Title" "Description" "Color(Decimal)"
 send_discord() {
     local title="$1"
     local description="$2"
     local color="$3"
-
-    # エスケープ処理（改行やクォート対策）
     description=$(echo "$description" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
-
-    # JSONペイロードの構築
     json_payload=$(cat <<EOF
 {
   "username": "${HOSTNAME} Maintenance",
@@ -59,11 +58,10 @@ send_discord() {
 }
 EOF
 )
-    # 送信 (エラー時はコンソールに出すだけでスクリプトは止めない)
     curl -H "Content-Type: application/json" -d "$json_payload" "$DISCORD_WEBHOOK_URL" > /dev/null 2>&1
 }
 
-# 色コード定義 (Decimal)
+# 色コード
 COLOR_BLUE=3447003
 COLOR_GREEN=3066993
 COLOR_RED=15158332
@@ -71,20 +69,23 @@ COLOR_RED=15158332
 # --- 開始通知 ---
 send_discord "Maintenance Started" "夜間メンテナンスを開始します。" "$COLOR_BLUE"
 
-# --- ログ記録開始 ---
 {
 echo "========================================================"
 echo "Maintenance Started: $(date)"
 echo "========================================================"
 
-# エラー発生時のフラグ
 ERROR_OCCURRED=0
 
-# エラーハンドリング関数 (ログ記録とフラグ立て)
 handle_error() {
     echo "[ERROR] $1"
     ERROR_OCCURRED=1
 }
+
+# 日付判定
+IS_SUNDAY=0
+IS_FIRST_DAY=0
+[ "$(date +%u)" -eq 7 ] && IS_SUNDAY=1
+[ "$(date +%d)" -eq 01 ] && IS_FIRST_DAY=1
 
 # ==============================================================================
 # 1. 日次処理 (Daily Tasks)
@@ -96,52 +97,63 @@ snap refresh || handle_error "Snap Refresh failed"
 docker system prune -f || handle_error "Docker prune failed"
 
 # Nextcloud Preview Generator
-if nextcloud.occ app:list | grep -q "previewgenerator: enabled"; then
+if $OCC_CMD app:list | grep -q "previewgenerator: enabled"; then
     echo "[Daily] Nextcloud: Pre-generating previews..."
-    nextcloud.occ preview:pre-generate || handle_error "Nextcloud Preview Generation failed"
+    $OCC_CMD preview:pre-generate || handle_error "Nextcloud Preview Generation failed"
 else
-    echo "[Daily] Nextcloud: Preview Generator app is not enabled. Skipping."
+    echo "[Daily] Nextcloud: Preview Generator app is not enabled or not found. Skipping."
 fi
 
 # ==============================================================================
-# 2. 週次処理 (Weekly Tasks) - Sunday
+# 2. 週次処理 (Weekly Tasks) - 毎週日曜日
 # ==============================================================================
-if [ "$(date +%u)" -eq 7 ]; then
+if [ $IS_SUNDAY -eq 1 ]; then
     echo "--------------------------------------------------------"
     echo "[Weekly] Starting Weekly Tasks..."
 
     echo "[Weekly] Running fstrim for SSD..."
     fstrim -v -a || handle_error "fstrim failed"
 
-    echo "[Weekly] HDD SMART Short Test..."
-    smartctl -t short /dev/sda || handle_error "SMART Short Test (sda) failed"
-    smartctl -t short /dev/sdb || handle_error "SMART Short Test (sdb) failed"
-
+    # Nextcloud DB & Cleanup
     echo "[Weekly] Nextcloud: Optimizing Database..."
-    nextcloud.occ db:add-missing-indices --no-interaction || handle_error "Nextcloud DB Indices failed"
-    nextcloud.occ db:add-missing-columns --no-interaction || handle_error "Nextcloud DB Columns failed"
-    nextcloud.occ db:add-missing-primary-keys --no-interaction || handle_error "Nextcloud DB PrimaryKeys failed"
+    $OCC_CMD db:add-missing-indices --no-interaction || handle_error "Nextcloud DB Indices failed"
+    $OCC_CMD db:add-missing-columns --no-interaction || handle_error "Nextcloud DB Columns failed"
+    $OCC_CMD db:add-missing-primary-keys --no-interaction || handle_error "Nextcloud DB PrimaryKeys failed"
 
     echo "[Weekly] Nextcloud: Cleaning up..."
-    nextcloud.occ files:cleanup || handle_error "Nextcloud Files Cleanup failed"
-    nextcloud.occ trashbin:cleanup --all-users || handle_error "Nextcloud Trashbin Cleanup failed"
-    nextcloud.occ versions:cleanup || handle_error "Nextcloud Versions Cleanup failed"
+    $OCC_CMD files:cleanup || handle_error "Nextcloud Files Cleanup failed"
+    $OCC_CMD trashbin:cleanup --all-users || handle_error "Nextcloud Trashbin Cleanup failed"
+    $OCC_CMD versions:cleanup || handle_error "Nextcloud Versions Cleanup failed"
 fi
 
 # ==============================================================================
-# 3. 月次処理 (Monthly Tasks) - 1st day
+# 3. 月次処理 (Monthly Tasks) - 毎月1日
 # ==============================================================================
-if [ "$(date +%d)" -eq 01 ]; then
+if [ $IS_FIRST_DAY -eq 1 ]; then
     echo "--------------------------------------------------------"
     echo "[Monthly] Starting Monthly Tasks..."
-
-    echo "[Monthly] HDD SMART Long Test..."
-    smartctl -t long /dev/sda || handle_error "SMART Long Test (sda) failed"
-    smartctl -t long /dev/sdb || handle_error "SMART Long Test (sdb) failed"
 
     echo "[Monthly] Removing old kernels and logs..."
     apt-get autoremove -y || handle_error "APT Autoremove failed"
     journalctl --vacuum-time=1month || handle_error "Journalctl vacuum failed"
+fi
+
+# ==============================================================================
+# 4. S.M.A.R.T. テスト (排他制御)
+# ==============================================================================
+echo "--------------------------------------------------------"
+# 優先順位: 月初(Long) > 日曜(Short)
+# 1日であればロングテストを実行。そうでなくて日曜日ならショートテストを実行。
+
+if [ $IS_FIRST_DAY -eq 1 ]; then
+    echo "[Monthly] HDD SMART Long Test (Priority High)..."
+    smartctl -t long /dev/sda || handle_error "SMART Long Test (sda) failed"
+    smartctl -t long /dev/sdb || handle_error "SMART Long Test (sdb) failed"
+
+elif [ $IS_SUNDAY -eq 1 ]; then
+    echo "[Weekly] HDD SMART Short Test..."
+    smartctl -t short /dev/sda || handle_error "SMART Short Test (sda) failed"
+    smartctl -t short /dev/sdb || handle_error "SMART Short Test (sdb) failed"
 fi
 
 echo "========================================================"
@@ -151,14 +163,11 @@ echo ""
 } >> "$LOGFILE" 2>&1
 
 # --- 終了通知 ---
-# ログの最後の10行を取得してDiscordに添付
 LOG_TAIL=$(tail -n 10 "$LOGFILE")
 
 if [ "$ERROR_OCCURRED" -eq 1 ]; then
-    # エラーあり: 赤色で通知
     send_discord "Maintenance Completed with ERRORS" "メンテナンス中にエラーが発生しました。\nログを確認してください。\n\`\`\`\n${LOG_TAIL}\n\`\`\`" "$COLOR_RED"
 else
-    # 正常終了: 緑色で通知
     send_discord "Maintenance Finished Successfully" "全ての処理が完了しました。\n\`\`\`\n${LOG_TAIL}\n\`\`\`" "$COLOR_GREEN"
 fi
 
